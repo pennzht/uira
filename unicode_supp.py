@@ -47,7 +47,7 @@ def getkey_untranslated(sc):
         meta = ''
 
         key = sc.getkey()
-        
+
         if key == '\x1B':
             meta = 'Meta+'
             key = sc.getkey()

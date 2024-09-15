@@ -172,7 +172,7 @@ class TextFile:
 
                 continuant == 'deletechar' and
                 self.now.deed[1] == start
-            ) 
+            )
         )
 
         if is_continuing and continuant == 'backspace':
@@ -772,7 +772,7 @@ class Editor:
         # Editor.send_key
         # On receiving key, decide what to do.
         focus, y0, x0, y1, x1 = self.get_focus_full()
-        
+
         self.powerline = ''
 
         if self.mode == 'F':
@@ -1014,7 +1014,7 @@ class Editor:
             elif type (node) is list:
                 if not (len (node) >= 3 and node[0] in ['layout:ltr', 'layout:ttb']):
                     log (f'assert failed: {node}')
-                    
+
                 [fmt, *subnodes] = node
                 n = len (subnodes)
 
@@ -1034,7 +1034,7 @@ class Editor:
                     for i, subnode in enumerate (subnodes):
                         _compute_node (subnode,
                                        y0 + totalh * i // n,
-                                       x0, 
+                                       x0,
                                        y0 + totalh * (i+1) // n,
                                        x1,
                                        )
@@ -1136,7 +1136,7 @@ class Editor:
                 )
 
         # Put at active location.
-        
+
         focus, y0, x0, y1, x1 = self.get_focus_full()
 
         [yoffset, xoffset] = focus.getcursor()
