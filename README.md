@@ -43,6 +43,7 @@ Due to personal plans,
 Next plans:
 
 1. Important basic features
+    - Add testing
     - Replace
     - Open files while in editor
     - Suspending the editor (to use the shell)
