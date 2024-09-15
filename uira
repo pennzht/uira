@@ -1,0 +1,1261 @@
+#!/usr/bin/python3
+
+import curses
+import sys
+import time
+import os
+import dataclasses
+import unicodedata
+
+from unicode_supp import *
+from typeset_engine import *
+from common import *
+from colors import *
+import dbl    # sized_sequence{,_3}
+import initial_windows
+
+print ('Editor is running.')
+
+glob = {'windowid': 0}
+screen_cache = {}
+screen = {}
+
+# Used for handling caches
+def addch (sc, i, j, char, color = None):
+    color = color or C('default')
+    screen[i, j] = (char, color)
+
+    '''
+    color = color or C('default')
+    if screen_cache[i, j] == (char, color): return
+    sc.addch (i, j, char, color)
+    screen_cache[i, j] = (char, color)
+    '''
+
+def addstr (sc, i, j, string, color = None):
+    color = color or C('default')
+    for (dx, char) in enumerate (string):
+        screen[i, j+dx] = (char, color)
+
+def refresh (sc, yx):
+    for (i, j) in screen_cache:
+        if (i, j) not in screen:
+            # Delete
+            sc.addch (i, j, ' ', C('default'))
+    for (i, j) in screen:
+        if (i, j) in screen_cache and screen_cache[i, j] == screen[i, j]:
+            # No change
+            pass
+        else:
+            sc.addch (i, j, screen[i, j][0], screen[i, j][1])
+
+    screen_cache.clear()
+    for (a, b) in screen.items(): screen_cache[a] = b
+    screen.clear()
+
+    move (sc, *yx)
+
+    sc.refresh()
+
+def clamp (low, value, high):
+    return max (low, min (value, high))
+
+def move (sc, i, j):
+    y, x = sc.getmaxyx ()
+    i = clamp (0, i, y-1)
+    j = clamp (0, j, x-1)
+    sc.move (i, j)
+
+def between (a, b, c):
+    return (None not in [a, b, c]) and (a <= b < c or c <= b < a)
+
+class HistoryNode:
+    # Snapshot of any point in history, with its past (last action = deed)
+    #     and futures (potential future nodes)
+    def __init__(self, state, parent=None, deed=None):
+        self.state = state    # should be a [BalancedList], or just [List] of [TextPiece]s.
+        self.parent = parent
+        self.deed = deed
+        self.children = []
+        self.main_child_index = None    # which child is the "main line variation".
+        if parent:
+            parent.children.append(self)
+            parent.main_child_index = len(parent.children) - 1    # Make this the main child.
+
+    def main_child (self):
+        if self.children and self.main_child_index is not None:
+            return self.children[self.main_child_index]
+        return None
+
+    # deed is one of:
+    # ['create', 0, 0]
+    # ['delete', before.start, before.stop]
+    # ['delete:cut', before.start, before.stop]
+            # temporary option for cutting, without move protection
+    # ['insert:type', after.start, after.stop]
+    # ['insert:snippet', after.start, after.stop]
+    # ['insert:move', after.start, after.stop]
+    # ['insert:paste', after.start, after.stop]
+    # ['overwrite', after.start, after.stop]
+    # This allows better positioning of cursors after undo/redo.
+
+class TextFile:
+    # id is either special:... or file:...
+    # filename: str, id: str, initial_data: str
+    # cut_region: slice, root: HistoryNode, now: HistoryNode
+    def __init__(self, filename = None, id = None, initial_data = ''):
+        self.initial_data = initial_data
+        self.filename = filename
+        if filename and os.path.exists(filename):
+            with open (filename, 'r') as f:
+                self.initial_data = f.read()
+
+        self.id = id
+        self.cut_region = None    # Nothing is cut for now; if exists, (start, stop)
+                # Serves as a command to tell which area to cut (move).
+
+        state = [
+            ColoredChar (
+                ch,
+                meta = (4, 'orig', self.id)
+            )
+            for ch in self.initial_data
+        ]
+
+        # History
+        self.root = HistoryNode(
+            state = state,
+            parent = None,
+            deed = ['create', 0, 0],
+        )
+        self.now = self.root
+
+        self.coloring = None
+
+    def insert (self, position, content, continuant = None, action = 'insert:type'):
+        state = self.now.state[:]
+        state[position:position] = content
+
+        is_continuing = (
+            self.now.deed[0] == 'insert:type' and
+            self.now.deed[2] == position and
+            not self.now.children
+        )
+
+        if is_continuing:
+            self.now.state = state
+            old_deed = self.now.deed
+            self.now.deed = [action, old_deed[1], position + len(content)]
+        else:
+            # Add child state
+            new_state = HistoryNode(
+                state,
+                parent = self.now,
+                deed = [action, position, position + len (content)],
+            )
+            self.now = new_state
+
+        return self.now.deed[2]    # pos at end
+
+    def delete (self, start, stop, continuant = None, action = 'delete'):
+        state = self.now.state[:]
+        state[start:stop] = []
+
+        is_continuing = (
+            self.now.deed[0] == 'delete' and
+            not self.now.children and
+            (
+                continuant == 'backspace' and
+                self.now.deed[1] == stop
+
+                or
+
+                continuant == 'deletechar' and
+                self.now.deed[1] == start
+            ) 
+        )
+
+        if is_continuing and continuant == 'backspace':
+            self.now.state = state
+            old_deed = self.now.deed
+            self.now.deed = [action, start, old_deed[2]]
+        elif is_continuing and continuant == 'deletechar':
+            chars_deleted = self.now.deed[2] - self.now.deed[1] + 1
+            old_deed = self.now.deed
+            self.now.deed = [action, start, chars_deleted]
+            self.now.state = state
+        else:
+            # Add child state
+            new_state = HistoryNode(
+                state,
+                parent = self.now,
+                deed = [action, start, stop],
+            )
+            self.now = new_state
+
+        return self.now.deed[1]    # post at begin
+
+    def undo (self):
+        if self.now.parent:
+            self.now = self.now.parent
+
+        [action, start, stop] = self.now.deed
+        return start if action == 'delete' else stop    # position
+
+    def redo (self):
+        if self.now.children:
+            self.now = self.now.main_child()
+
+        [action, start, stop] = self.now.deed
+        return start if action == 'delete' else stop    # position
+
+    def get_region (self, start, stop):
+        start = clamp (0, start, len(self.now.state))
+        stop = clamp (0, stop, len(self.now.state))
+        return self.now.state[start : stop]
+
+    def entire_colored_text (self):
+        return self.now.state
+
+    def entire_text (self):
+        return ''.join (x.ch for x in self.now.state)
+
+    def entire_true_text (self):
+        return ''.join (
+            x.ch
+            for x in self.now.state
+            if x.meta[0] not in [2, 5]    # not comment or sentinel
+        )
+
+@dataclasses.dataclass
+class Window:
+    # Different from TextFile; this has an anchor or something similar.
+    # mark and pos locations: int (simple addressing)
+    # cursor: 2-dim [y, x]
+    # width and height: of window
+    # ystart: y of top-left corner char
+    # chars: typesetting result
+    text_file: object
+    height: int
+    width: int
+
+    mark: int
+    pos: int
+    cursor: object
+
+    ystart: int
+    chars: list
+
+    def __repr__ (self):
+        return f'Window({self.text_file.id})'
+
+    def __post_init__ (self):
+        glob['windowid'] += 1
+        self.windowid = glob['windowid']
+
+    def clone(self):
+        return dataclasses.replace(self)
+
+    def scroll_in_sight (self):
+        [i, j ] = self.cursor
+        if not (self.ystart <= i < self.ystart + self.height):
+            # Out of window
+            self.ystart = max (0, i - self.height // 2)
+
+    def setcursor (self, cursor):
+        [i, j] = cursor
+        i = clamp (0, i, self.chars[-1].y)
+        self.cursor = [i, j]
+
+        for char in reversed (self.chars):
+            if [char.y, char.x] <= [i, j]:
+                self.pos = char.pos
+                break
+
+        self.scroll_in_sight()
+
+    def getcursor (self):
+        pos = self.pos
+        char = self.chars[pos]
+        [y, x] = [char.y, char.x]
+        return [y, x]
+
+    def setpos (self, pos):
+        # Limit pos
+        pos = clamp (0, pos, len (self.chars) - 1)
+        self.pos = pos
+        char = self.chars[pos]
+        self.cursor = [char.y, char.x]
+
+        self.scroll_in_sight()
+
+    def hasregion (self):
+        return self.mark not in [None, self.pos]
+
+    def region (self):
+        return sorted ([self.mark, self.pos])
+
+    def goto_line (self, ll):
+        if ll <= 0:
+            self.setpos (0)
+        else:
+            for char in self.chars:
+                if char.ll == ll:
+                    self.setpos (char.pos); return
+            self.setpos (len (self.chars))  # End of chars
+
+    def current_line (self):
+        pos = self.pos - 1
+        while pos >= 0 and self.chars[pos].ch != '\n':
+            pos -= 1
+        # If pos < 0, then not found. Otherwise, is \n.
+        line_head = max(0, 1 + pos)
+        space_ends = self.pos
+        for i in range (line_head, self.pos):
+            if self.chars[i].ch not in [' ', '\t']:
+                space_ends = i
+                break
+        whitespace = self.text_file.now.state[line_head : space_ends]
+        return line_head, space_ends, self.pos, whitespace
+
+    def send_key (self, key, clipboard = None, comment_mode = False, editor = None):
+        # Window.send_key
+
+        # First part: navigation
+        if key == 'KEY_UP':
+            [a, b] = self.cursor
+            self.setcursor ([a-1, b])
+        elif key == 'KEY_DOWN':
+            [a, b] = self.cursor
+            self.setcursor ([a+1, b])
+        elif key == 'KEY_LEFT':
+            self.setpos (self.pos - 1)
+        elif key == 'KEY_RIGHT':
+            self.setpos (self.pos + 1)
+        elif key == 'KEY_PPAGE':
+            [a, b] = self.cursor
+            self.setcursor ([a-self.height, b])
+        elif key == 'KEY_NPAGE':
+            [a, b] = self.cursor
+            self.setcursor ([a+self.height, b])
+        elif key == 'KEY_END':
+            data = self.text_file.entire_text()
+            for i in range(self.pos, len(data)):
+                if data[i] == '\n':
+                    self.setpos(i)
+                    break
+            else:
+                self.setpos(len(data))
+        elif key == 'KEY_HOME':
+            data = self.text_file.entire_text()
+            for i in range(self.pos, 0, -1):
+                if data[i-1] == '\n':
+                    self.setpos(i)
+                    break
+            else:
+                self.setpos(0)
+
+        # Part: jump by words
+        elif key in ['Meta+b', 'Meta+f', 'Meta+KEY_BACKSPACE', 'Meta+h', 'Meta+d']:
+            def is_alphanum(char): return '0' <= char.ch <= '9' or 'a' <= char.ch.lower() <= 'z'
+            def is_punct(char): return not is_alphanum(char)
+
+            find_dir = -1 if key in ['Meta+b', 'Meta+KEY_BACKSPACE', 'Meta+h'] else +1
+            action = 'go' if key in ['Meta+b', 'Meta+f'] else 'delete'
+
+            pos = self.pos
+            while 0 < pos < len(self.chars):
+                pos += find_dir
+                if find_dir > 0:
+                    stop = is_alphanum(self.chars[pos-1]) and is_punct(self.chars[pos])
+                else:
+                    stop = is_alphanum(self.chars[pos]) and is_punct(self.chars[pos-1])
+                if stop:
+                    break
+
+            # Position found
+            if action == 'go':
+                self.setpos(pos)
+            else:
+                [a, b] = sorted([pos, self.pos])
+                self.text_file.delete(a, b)
+                self.setpos(a)
+
+        # Part: undo/redo
+        elif key == ctrl('U'):
+            pos = self.text_file.undo()
+            self.setpos(pos)
+
+        elif key == ctrl('Y'):
+            pos = self.text_file.redo()
+            self.setpos(pos)
+
+        elif key in [ctrl('C'), ctrl('X'), ctrl('V'), 'Meta+v']:
+            # clipboard
+            assert clipboard is not None
+            if key == ctrl('C'):
+                if self.hasregion():
+                    [a, b] = self.region()
+                    self.mark = None
+                    clipboard.append (self.text_file.get_region (a, b))
+                    return True, 'Copied', len (clipboard[-1])
+                else: return False, 0, 0
+            elif key == ctrl('X'):
+                if self.hasregion():
+                    [a, b] = self.region()
+                    self.mark = None
+                    clipboard.append (self.text_file.get_region (a, b))
+                    self.text_file.delete (a, b, action = 'delete:cut')
+                    typeset(self)
+                    self.setpos(a)
+                    return True, 'Cut', len (clipboard[-1])
+                else: return False, 0, 0
+            elif key == ctrl('V'):
+                if clipboard:
+                    self.mark = None
+                    text = clipboard.pop()
+                    self.text_file.insert (self.pos, text, action = 'insert:paste')
+                    typeset(self)
+                    self.setpos(self.pos + len(text))
+                    return True, 'Pasted', len(text)
+                else: return False, 0, 0
+            elif key == 'Meta+v':
+                if clipboard:
+                    self.mark = None
+                    text = clipboard[-1]
+                    self.text_file.insert (self.pos, text, action = 'insert:paste')
+                    typeset(self)
+                    self.setpos(self.pos + len(text))
+                    return True, 'Pasted duplicate', len(text)
+                else: return False, 0, 0
+
+        elif key == ctrl('@'):
+            if self.mark is None:
+                self.mark = self.pos
+            else:
+                self.mark = None
+
+        # Part: top/center
+        elif key in ['Meta+t', 'Meta+m']:
+            goal_line = self.height // 2 if key == 'Meta+m' else 0
+            goal_ystart = max(0, self.cursor[0] - goal_line)
+            self.ystart = goal_ystart
+
+        elif key == 'Meta+8':
+            # Goto end of next comment
+            for jump in range (1, len (self.chars) + 2):
+                offset = (self.pos + jump) % len (self.chars)
+                offset_next = (offset + 1) % len (self.chars)
+                if self.chars[offset].meta == (2,) and self.chars[offset_next].meta != (2,):
+                    self.setpos (offset_next)
+                    break
+
+        elif key == 'Meta+*':
+            # Goto next ✷ and delete it on spot.
+            for jump in range (1, len (self.chars) + 2):
+                offset = (self.pos + jump) % len (self.chars)
+                if self.chars[offset].meta == (2,) and self.chars[offset].ch == '✷':
+                    self.text_file.delete (offset, offset+1)
+                    typeset(self)
+                    self.setpos (offset)
+                    break
+
+        elif key == 'Meta+C':
+            # Quick bookmark
+            self.text_file.insert (
+                self.pos,
+                [ColoredChar ('✷', meta=(2,))],
+                action = 'insert:bookmark',
+            )
+            typeset(self)
+            self.setpos (self.pos + 1)
+
+        elif key == 'Meta+<':
+            self.setpos (0)
+
+        elif key == 'Meta+>':
+            self.setpos (len (self.chars) + 1)
+
+        # Part: edit
+        elif key == 'KEY_BACKSPACE':
+            if self.hasregion():
+                # Delete region
+                [a, b] = self.region()
+                self.text_file.delete (a, b)
+                typeset(self)
+                self.setpos (a)
+                self.mark = None
+            else:
+                # Deletion
+                pos = self.pos
+                prepos = max(0, self.pos-1)
+                self.text_file.delete (prepos, pos, continuant='backspace')
+                typeset(self)
+                self.setpos (prepos)
+                self.mark = None
+        elif key == 'KEY_DC':
+            if self.hasregion():
+                # Delete region
+                [a, b] = self.region()
+                self.text_file.delete (a, b)
+                typeset(self)
+                self.setpos (a)
+                self.mark = None
+            else:
+                # Deletion
+                pos = self.pos
+                pospos = min (len(self.text_file.now.state), self.pos + 1)
+                self.text_file.delete (pos, pospos, continuant='deletechar')
+                typeset(self)
+                self.mark = None
+        elif key == '\n':
+            # New line, with indentation
+            line_head, space_ends, pos, whitespace = self.current_line()
+            if self.chars[pos-1].ch == ':' :
+                # Indent
+                new_indent = '    '
+            else:
+                new_indent = ''
+            text = '\n' + new_indent + ''.join (char.ch for char in whitespace)
+            text = [ColoredChar(
+                elem,
+                meta = (2, ) if comment_mode else (1, 'type'),
+            ) for elem in text]
+            self.text_file.insert (self.pos, text, continuant='type', action='insert:type')
+            typeset(self)
+            self.setpos (self.pos+len(text))
+        elif key in ['Meta+u', 'Meta+o', 'Meta+[', 'Meta+]']:
+            # Indent/dedent
+            line_head, space_ends, pos, whitespace = self.current_line()
+            space_size = space_ends - line_head
+            indent_direct = -1 if key in ['Meta+u', 'Meta+['] else +1
+            for _ in range (4):
+                space_size = max(0, space_size + indent_direct)
+                if space_size % 4 == 0: break
+            if space_size != space_ends - line_head:
+                # Indentation changed
+                self.text_file.delete (line_head, space_ends)
+                new_indentation = [
+                    ColoredChar(' ', meta = (1, 'type'))
+                    for _ in range (space_size)
+                ]
+                self.text_file.insert (line_head, new_indentation, action='insert:type')
+                typeset(self)
+                self.setpos (pos - (space_ends - line_head) + space_size)
+        elif key in PARENS:     # () [] {}
+            # Paired characters
+            paren_index = PARENS.index(key)
+            is_opening = paren_index % 2 == 0
+            partner = PARENS[paren_index ^ 1]   # 0 <-> 1, etc.
+            if is_opening:
+                self.text_file.insert (
+                    self.pos, [
+                        ColoredChar(
+                            ch,
+                            meta = (2,) if comment_mode else (1, 'type'),
+                        ) for ch in [key, partner]
+                    ],
+                    continuant = 'type',
+                    action = 'insert:type',
+                )
+                typeset(self)
+                self.setpos(self.pos + 1)    # Move in between
+            else:
+                char = self.chars[self.pos]
+                if char.ch == key:
+                    # Move right
+                    self.setpos(self.pos + 1)
+                else:
+                    self.text_file.insert (
+                        self.pos, [
+                            ColoredChar(
+                                ch,
+                                meta = (2,) if comment_mode else (1, 'type'),
+                            ) for ch in [key]
+                        ],
+                        continuant = 'type',
+                        action = 'insert:type',
+                    )
+                    typeset(self)
+                    self.setpos(self.pos + 1)
+
+        elif is_print_char (key):
+            # Simple insertion.
+            self.mark = None
+
+            text = [ColoredChar(
+                key,
+                meta = (2, ) if comment_mode else (1, 'type'),
+            )]
+
+            self.text_file.insert (self.pos, text, continuant='type', action='insert:type')
+            typeset(self)    # sets self.word_matches
+            self.setpos (self.pos+1)
+
+            if '0' <= key <= '9' or 'a' <= key.lower() <= 'z':
+                # Suggest autocompletes
+                finds = self.word_matches
+                current_prefix = '*'
+                words = {}
+                for find in finds:
+                    (start, stop) = find.span()
+                    if self.pos == stop:
+                        current_prefix = find.group(0)
+                    else:
+                        word = find.group(0)
+                        words.setdefault(word, 0)
+                        words[word] += 1
+                if '0' <= current_prefix[0] <= '9':
+                    pass  # do not autocomplete numbers
+                else:
+                    words = [(f, w) for (w, f) in words.items()
+                             if len(w) >= len(current_prefix) + 3 and
+                             w.startswith(current_prefix)]
+                    words.sort (reverse=True)
+                    words = words[:10]
+                    editor.autocomplete_suggestions = [
+                        (freq, word, current_prefix)
+                        for (freq, word) in words
+                    ]
+
+class Editor:
+    def __init__(self, sc):
+        self.sc = sc    # screen
+
+        self.mode = 'N'    # Normal mode
+        # Modes are:
+        # [N]ormal
+        # [L]ine, goto
+        # [F]ind
+        # [D]e Bruijn leap
+        # [S]nippet search
+        # [U]nicode search
+        # [H]istory view (anything more than simple ^U ^R should be this.)
+
+        self.comment_mode = False
+
+        # ID -> buffer
+        # namespace:name
+        # special:{start, ...}
+        # file:<filename>
+        self.buffers = {
+            'special:start': TextFile(
+                id = 'special:start',
+                initial_data = initial_windows.helper,
+            ),
+        }
+
+        # Instead of using a piece table, represent each piece using an obj,
+        #    TextPiece(content, frag, source)
+        #    So we can know where everything is.
+        #    And make use of Python's built-in garbage collection!
+
+        # \x01 a jump-to placeholder.
+        self.snippets = {
+            'd': 'def \x01(\x01):\x01',
+            's': 'self.',
+            't': 'True',
+            'f': 'False',
+            'm': 'if __name__ == "__main__":\n    main()\n\n',
+            'c': 'curses.',
+            'i': 'import ',
+            '-': '__\x01__',
+            '_': '__\x01__',
+        }
+
+        # Symbol table. Used to store symbols used in files.
+        # symbol -> frequency.
+        # Not necessarily true frequency, but "number of times typed"
+        # is a good indicator for usage frequency.
+        self.symbols = {'self': 10, 'curses': 10, 'sc': 10}
+
+        # Current window layout.
+        # One of:
+        #     window (contains link to text_tile)
+        #     [layout:ltr layout ...]
+        #     [layout:ttb layout ...]
+        self.layout = Window (
+            self.buffers['special:start'],
+            height= None,
+            width= None,
+            mark= None,
+            pos= 0,
+            cursor= [0, 0],
+            ystart= 0,
+            chars= [],
+        )
+        self.focused_window = 0    # Focused window index
+
+        # Clipboard. list of snips.
+        # each snip is a list of ColoredChar.
+        # ^V = paste + delete clipboard item
+        # Meta^V = paste + keep clipboard item
+        # Only one "cut" (move) should happen at a time, and
+        #     it must be the top of the stack.
+        self.clipboard = []
+
+        # Powerline, for displaying things AFTER main display.
+        self.powerline = ''
+
+        self.dbprefix = ''
+        # Pos map, allowing quick location of chars. (y, x) -> (window, pos)
+        self.dbmap = {}
+
+        self.dbsequence = ''
+        self.dbwidth = 3
+
+        # Find mode buffer
+        self.findstring = ''
+
+        self.autocomplete_suggestions = []
+
+    def get_focus_full (self):
+        (focus, y0, x0, y1, x1) = self.layout_board[self.focused_window]
+        return focus, y0, x0, y1, x1
+
+    def get_focus (self):
+        return self.get_focus_full()[0]
+
+    def add_window (self, direction: str):
+        focus = self.get_focus()
+
+        def _recur_add_window (layout, focus, direction: str):
+            if layout == focus:
+                # Root
+                return [direction,
+                        focus,
+                        focus.clone()]
+            elif type(layout) is Window:
+                # Single root window
+                return layout
+            elif type(layout) is list:
+                [layout_shape, *subs] = layout
+                for i, sub in enumerate ([*subs]):
+                    if type (sub) is list:
+                        subs[i] = _recur_add_window (subs[i], focus, direction)
+                    elif sub.windowid == focus.windowid:
+                        if layout_shape == direction:
+                            subs[i+1:i+1] = [focus.clone()]
+                        else:
+                            subs[i] = [direction, focus, focus.clone()]
+                        break
+                return [layout_shape, *subs]
+
+        self.layout = _recur_add_window (self.layout, focus, direction)
+        self.focused_window += 1
+        self.compute_layout()
+
+    def delete_window (self):
+        focus = self.get_focus()
+
+        def _recur_delete_window (layout, focus):
+            if type(layout) is Window:
+                # Root
+                return layout
+            elif type(layout) is list:
+                [layout_shape, *subs] = layout
+                for i, sub in enumerate ([*subs]):
+                    if type (sub) is list:
+                        subs[i] = _recur_delete_window (subs[i], focus)
+                    elif sub.windowid == focus.windowid:
+                        subs[i:i+1] = []
+                        break  # found
+                if len(subs) == 1:
+                    return subs[0]
+                else: return [layout_shape, *subs]
+
+        self.layout = _recur_delete_window (self.layout, focus)
+        self.focused_window = max (0, self.focused_window - 1)
+        self.compute_layout()
+
+    def send_key (self, key):
+        # Editor.send_key
+        # On receiving key, decide what to do.
+        focus, y0, x0, y1, x1 = self.get_focus_full()
+        
+        self.powerline = ''
+
+        if self.mode == 'F':
+            # Find mode
+            focus = self.get_focus()
+            if key in [ctrl('G'), 'Meta+.', '\n']:
+                # Exit mode
+                self.mode = 'N'
+                self.show(); return
+            elif is_print_char (key) and key not in ('\t', '\n'):
+                self.findstring += key
+            elif key in ['KEY_RIGHT', 'KEY_DOWN', '\t']:
+                # Navigate
+                focus.setpos (focus.pos + len (self.findstring))
+            elif key == 'KEY_BACKSPACE':
+                self.findstring = self.findstring[:-1]
+            else:
+                pass
+            # Trying to find character
+            text = focus.text_file.entire_text()
+            pos = focus.pos
+            jump = text[pos:].find(self.findstring)
+            if jump >= 0:
+                found = pos + jump
+            else:
+                jump = text[:pos].find(self.findstring)
+                if jump >= 0:
+                    found = jump
+                else:
+                    found = -1
+            if found >= 0:
+                focus.setpos(found)
+            else:
+                pass  # No move
+            self.powerline = f'Find mode: {self.findstring} @ {found}'
+            self.show()
+            return
+
+        if self.mode == 'D':
+            # De Bruijn mode
+            if len (key) == 1 and 'a' <= key <= 'z':
+                self.dbprefix += key
+                self.powerline = f'Leap mode: {self.dbprefix}'
+            else:
+                self.mode = 'N'
+                self.dbprefix = ''
+            # Jump if enough
+            if len(self.dbprefix) >= self.dbwidth:
+                index = self.dbsequence.find (self.dbprefix)
+                if index < 0:
+                    self.powerline = f'Leap failed: "{self.dbprefix}" not found.'
+                else:
+                    index += len (self.dbprefix)
+                    width = self.sc.getmaxyx()[1]
+                    y, x = index // width, index % width
+                    if (y, x) in self.dbmap:
+                        (window, pos) = self.dbmap[y, x]
+                        # Set focus to window
+                        for wi, wsize in enumerate(self.layout_board):
+                            ww, *_ = wsize
+                            if ww is window:
+                                self.focused_window = wi
+                                ww.setpos (pos)
+                                self.powerline = f'Leap successful.'
+                                break
+                        else:
+                            self.powerline = f'Leap failed: window not found.'
+                    else:
+                        self.powerline = f'Leap failed: "{self.dbprefix}" does not corresopnd to a char.'
+                self.mode = 'N'
+                self.dbprefix = ''
+            self.show()
+            return  # "Continue"
+
+        # Handle autocompletes
+        if key == '\t' or (key.startswith('Meta+') and key[-1] in '1234567890'):
+            # autocomplete
+            if self.autocomplete_suggestions:
+                focus = self.get_focus()
+                if key == '\t':
+                    index = 0
+                else:
+                    index = '1234567890'.find(key[-1])
+                if not (0 <= index < len (self.autocomplete_suggestions)):
+                    pass  # No such autocomplete
+                else:
+                    (freq, word, prefix) = self.autocomplete_suggestions[index]
+                    adder = word[len(prefix):]
+                    focus.text_file.insert (
+                        focus.pos,
+                        [ColoredChar(
+                            elem,
+                            meta = (2, ) if self.comment_mode else (1, 'type'),
+                        ) for elem in adder],
+                        continuant = 'type',
+                        action = 'insert:type',
+                    )
+                    typeset(focus)
+                    focus.setpos (focus.pos + len (adder))
+            else:
+                pass
+            self.autocomplete_suggestions.clear()
+            self.show()
+            return  # "Continue"
+
+        self.autocomplete_suggestions.clear()
+
+        if key in ['Meta+n', 'Meta+N']:
+            # Next window
+            roll_dir = 1 if key == 'Meta+n' else -1
+            self.focused_window = (self.focused_window + roll_dir) % len (self.layout_board)
+        elif key == 'Meta+R':
+            self.add_window (direction='layout:ltr')
+        elif key == 'Meta+D':
+            self.add_window (direction='layout:ttb')
+        elif key == 'Meta+)':
+            self.delete_window ()
+        elif key == 'Meta+!':
+            # Just one window
+            focus = self.get_focus()
+            self.layout = focus
+            self.focused_window = 0
+            self.compute_layout()
+        elif key == 'Meta+c':
+            # Comment mode
+            self.comment_mode = not self.comment_mode
+        elif key == ctrl('L'):
+            # Goto line
+            self.show_powerline ('Goto line: ')
+            line_buffer = ''
+            while True:
+                key = getkey(self.sc)
+                if key in [ctrl('L'), ctrl('Q')]:
+                    break
+                elif '0' <= key <= '9':
+                    line_buffer += key
+                elif key == '\n':
+                    ll = int ('0' + line_buffer)
+                    focus = self.get_focus()
+                    focus.goto_line (ll)
+                    self.powerline = 'Went to line ' + line_buffer
+                    break
+                elif key == 'KEY_BACKSPACE':
+                    line_buffer = line_buffer[:-1]
+                else:
+                    break
+                self.show_powerline ('Goto line: ' + line_buffer)
+
+        elif key == 'Meta+i':
+            # Snippet insert
+            self.show_powerline ('Shortcut [' + ''.join(self.snippets) + '] ')
+            key = getkey(self.sc)
+            if key.startswith('Meta+'): key = key[5:]
+            if key in self.snippets:
+                # Insert
+                focus = self.get_focus()
+                text = self.snippets[key]
+                hole = text.find('\x01')
+                if hole >= 0:
+                    text = text[:hole] + text[hole+1:]
+                else: hole = len(text)
+                text = [
+                    ColoredChar(
+                        '✷' if ch == '\x01' else ch,
+                        (2,) if ch == '\x01' else (1, 'snip'),
+                    )
+                    for ch in text
+                ]
+                focus.text_file.insert (focus.pos, text, action = 'insert:snippet')
+                typeset(focus)
+                focus.setpos (focus.pos + hole)
+                self.powerline = f'Shortcut ({key}) done.'
+            else:
+                self.powerline = f'No such shortcut ({key})'
+        elif key in ['Meta+y', 'Meta+Y']:
+            # Next or previous buffer (text file)
+            roll_dir = 1 if key == 'Meta+y' else -1
+            focus = self.get_focus()
+            bufflist = list(self.buffers)
+            ind = bufflist.index(focus.text_file.id)
+            new_buf_name = bufflist[(ind + roll_dir) % len(bufflist)]
+            new_buf = self.buffers[new_buf_name]
+            focus.text_file = new_buf
+            focus.mark = None
+            focus.pos = 0
+            focus.cursor = [0, 0]
+            focus.ystart = 0
+            focus.chars = None
+            typeset (focus)
+        elif key == ctrl('S'):
+            # save files
+            written_count = 0
+            for text_file in self.buffers.values():
+                if text_file.id.startswith('file:'):
+                    filename = text_file.filename
+                    with open(filename, 'w+') as f:
+                        f.write(text_file.entire_true_text())
+                        written_count += 1
+            self.powerline = f'{written_count} files written.'
+        elif key in [ctrl('C'), ctrl('X'), ctrl('V'), 'Meta+v']:
+            # Send clipboard too
+            success, msg, size = focus.send_key (key, clipboard=self.clipboard)
+            if success:
+                self.powerline = f'{msg} {size} chars, clipboard now has {len(self.clipboard)} items'
+            else:
+                self.powerline = f'Clipboard operation inapplicable.'
+
+        elif key == 'Meta+l':
+            # De Bruijn leap mode
+            self.mode = 'D'
+            self.powerline = 'Leap mode'
+            (h, w) = self.sc.getmaxyx()
+            dbl_result = dbl.sized_sequence ((h-2) * w)
+            self.dbsequence = dbl_result['sequence']
+            self.dbwidth = dbl_result['width']
+        elif key == ctrl('G'):
+            # Find mode
+            self.mode = 'F'
+            self.findstring = ''
+            self.powerline = 'Find mode: '
+        elif key == 'Meta+\n':
+            # Combined key
+            self.send_key ('KEY_END')
+            self.send_key ('\n')
+        else:
+            focus.send_key (key, clipboard=None, comment_mode=self.comment_mode, editor=self)
+
+        self.show()
+
+    def compute_layout (self):
+        self.layout_board = []
+
+        def _compute_node (node, y0, x0, y1, x1):
+            if type (node) is Window:
+                assert node.text_file in self.buffers.values()
+                node.height = y1 - y0 - BASELINE
+                node.width = x1 - x0 - GUTTER
+                self.layout_board.append ((node, y0, x0, y1, x1))
+            elif type (node) is list:
+                if not (len (node) >= 3 and node[0] in ['layout:ltr', 'layout:ttb']):
+                    log (f'assert failed: {node}')
+                    
+                [fmt, *subnodes] = node
+                n = len (subnodes)
+
+                if fmt == 'layout:ltr':
+                    # Compute width inters
+                    totalw = x1 - x0
+                    for i, subnode in enumerate (subnodes):
+                        _compute_node (subnode,
+                                       y0,
+                                       x0 + totalw * i // n,
+                                       y1,
+                                       x0 + totalw * (i+1) // n,
+                                       )
+                else:
+                    # Compute height inters
+                    totalh = y1 - y0
+                    for i, subnode in enumerate (subnodes):
+                        _compute_node (subnode,
+                                       y0 + totalh * i // n,
+                                       x0, 
+                                       y0 + totalh * (i+1) // n,
+                                       x1,
+                                       )
+        _compute_node (self.layout, 0, 0, self.sc.getmaxyx ()[0]-1, self.sc.getmaxyx()[1])
+
+        return self.layout_board
+
+    def show_powerline (self, line):
+        h, w = self.sc.getmaxyx()
+        self.sc.addstr (h - 1, 0, ' '* (w-1))    # Erase previous line
+        self.sc.addstr (h - 1, 0, line)
+        self.sc.refresh()
+
+    def show (self):
+        sc = self.sc
+
+        self.compute_layout ()
+
+        self.dbmap.clear()
+
+        # Clear powerline
+        (h, w) = self.sc.getmaxyx()
+        self.sc.addstr (h-1, 0, ' ' * (w-1))
+
+        for (window, y0, x0, y1, x1) in self.layout_board:
+            typeset (window)
+
+            self.put_window (
+                window,
+                y0, x0, y1, x1,
+                offset = window.ystart
+            )
+
+        # If state is D (de bruijn leap), show hints
+        if self.mode == 'D':
+            h, w = self.sc.getmaxyx()
+            showchars = set()
+
+            # show for dbmap only.
+            for (y, x) in self.dbmap:
+                index = y * w + x
+                is_match = self.dbsequence[index - self.dbwidth : index].startswith(self.dbprefix)
+                if is_match:
+                    for i in range (index - self.dbwidth, index):
+                        showchars.add (i)
+
+            for i, ch in enumerate (self.dbsequence):
+                if i not in showchars: continue
+                y, x = i // w, i % w
+
+                # Determine char class
+                if (y, x) not in self.dbmap:
+                    color = C('gray/BLUE')
+                else:
+                    (window, pos) = self.dbmap[y, x]
+                    char = window.chars[pos]
+                    coloring = window.text_file.coloring
+                    color_index = coloring[pos] if 0 <= pos < len(coloring) else 0
+
+                    if color_index > 0:
+                        color = db_colors[color_index]
+                    elif char.ch in [' ', '\t', '\n']:
+                        color = C('gray/GRAY')
+                    else:
+                        color = db_colors[0]
+
+                addch (self.sc, y, x, ch, color)
+
+        # Set powerline from mode
+        if not self.powerline:
+            if self.comment_mode:
+                self.powerline = '(Comment mode)'
+
+        # Set powerline
+        if self.powerline:
+            self.show_powerline(self.powerline)
+
+        # Suggest autocompletes.
+        if self.autocomplete_suggestions:
+            self.suggline = ' '.join(
+                chr(i+1) + '\x00' + w
+                for (i, (f, w, prefix)) in enumerate (self.autocomplete_suggestions)
+            )
+            width = sc.getmaxyx()[1]-1
+            y = sc.getmaxyx()[0]-1
+            if len (self.suggline) > width:
+                self.suggline = self.suggline[:width-3] + '...'
+            sc.addstr(y, 0, ' ' * width)   # Clear line
+            for i, ch in enumerate(self.suggline):
+                color = C('default')
+                displaych = ch
+                if 0 <= ord(ch) <= 10:
+                    displaych = '.1234567890'[ord(ch)]
+                    color = C('yellow/default') | curses.A_BOLD
+                sc.addch (
+                    y, i,
+                    displaych,
+                    color,
+                )
+
+        # Put at active location.
+        
+        focus, y0, x0, y1, x1 = self.get_focus_full()
+
+        [yoffset, xoffset] = focus.getcursor()
+        yoffset -= focus.ystart
+        y = clamp (y0, y0+yoffset, y1-1)
+        x = clamp (x0, x0+xoffset, x1-1)
+        move (sc, y, x + GUTTER)
+
+        refresh(sc, (y, x + GUTTER))
+
+    def put_window (self, window, y0, x0, y1, x1, offset):
+        # Put background
+        focus = self.get_focus()
+        is_focus = (focus is window)
+        border_color = 'white/BLUE' if is_focus else 'gray/GRAY'
+
+        for y in range (y0, y1):
+            addstr (self.sc, y, x0, ' ' * GUTTER, C(border_color))
+        addstr (self.sc, y1 - 1, x0, ' ' * (x1-x0), C(border_color))
+
+        for index, char in enumerate(window.chars):
+            yoffset = char.y - offset
+            xoffset = char.x
+
+            if not (0 <= xoffset < window.width and 0 <= yoffset < window.height): continue
+
+            color = C('default')
+
+            # Color by coloring
+            if window.text_file.coloring:
+                if index < len(window.text_file.coloring):
+                    color = syntax_colors[window.text_file.coloring[index]]
+
+            if self.mode == 'D':
+                # De Bruijn, gray out everything in background
+                color = C('gray/default')
+            elif char.meta[0] == 5:
+                color = C('GRAY/BLACK') | curses.A_BOLD
+            elif char.meta[0] == 2:
+                color = C('gray/BLACK')  # Comment
+            else:
+                if window.hasregion():
+                    [a, b] = window.region()
+                    if a <= index < b:
+                        color = C('BLACK/orange')    # Selected region
+
+            y = y0 + yoffset
+            x = x0 + xoffset + GUTTER
+            self.dbmap[y, x] = (window, char.pos)
+            addch(self.sc, y, x, norm(char.ch), color)
+
+            if char.lc == 1:
+                # Line head
+                linenum = ('      ' + str(char.ll))[-4:] + ' '
+                if char.ll > 9999: linenum = '.' + linenum[1:]
+                addstr (self.sc, y0 + yoffset, x0, linenum, C(border_color))
+
+        # Put powerline
+        title = window.text_file.id
+        space_allowed = x1 - x0
+        title = title[:space_allowed]
+        for i in range (space_allowed):
+            if len (title) > space_allowed:
+                title = title[:-1]
+            else: break
+        addstr (self.sc, y1 - 1, x0, title, C(border_color))
+
+
+def main (sc):
+    curses.raw()  # Listens to ^S, ^Q, etc.
+
+    curses.use_default_colors()
+    init_colors()
+
+    sc.scrollok(0)
+    # sc.nodelay(1)    # set to 1 to avoid hanging, allowing editor to run without user input.
+
+    ed = Editor(sc)
+
+    ### Initialize editor.
+    [prog_name, * file_names] = sys.argv
+
+    first_file_name = None
+
+    for fn in file_names:
+        fnid = f'file:{fn}'
+        if fnid not in ed.buffers:
+            ed.buffers[fnid] = TextFile(filename = fn, id = fnid)
+            if not first_file_name:
+                first_file_name = fnid
+
+    if first_file_name:
+        ed.layout = Window(
+            ed.buffers[first_file_name],
+            height = None,
+            width = None,
+            mark = None,
+            pos = 0,
+            cursor = [0, 0],
+            ystart = 0,
+            chars = [],
+        )
+        ed.compute_layout()
+
+    ed.show()
+
+    ### Start the loop of listening to keys and responding.
+    while True:
+        key = getkey(sc)
+
+        if not key: continue
+
+        if key == 'KEY_RESIZE':
+            screen_cache.clear()
+
+        if key == ctrl('Q'): break
+
+        ed.send_key (key)
+
+curses.wrapper (main)
+for elem in outlog: print(elem)
+
