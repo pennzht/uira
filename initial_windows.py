@@ -5,6 +5,11 @@ helper = '''\
 
 0 = black, 1 = red, 2 = green, 3 = yellow, 4 = blue, 5 = magenta, 6 = cyan, 7 = white
 
+Caret (^) means Control. Colon (:) means Meta (usually the Alt key).
+    ^A = Control+A
+    :c = Meta+C
+    :C = Meta+Shift+C
+
               ==== Navigation ====
 ^Q            quit
 ↑ / ^P        move up
