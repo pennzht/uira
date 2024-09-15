@@ -1,0 +1,199 @@
+#!/usr/bin/python3
+
+
+
+# Ropes
+# Piece tables
+
+# De Bruijn sequence
+
+import curses, dataclasses, sys, os
+
+def ctrl(ch): return chr(ord(ch) & 0x1F)
+
+@dataclasses.dataclass
+class Char:
+    ch: str
+    pos: int
+    ll: int
+    lc: int
+    y: int
+    x: int
+
+class Editor:
+    def __init__(self, sc, fn):
+        self.sc, self.fn = sc, fn
+        
+        if os.path.exists(fn):
+            with open(fn, 'r') as f:
+                self.data = f.read()
+        else:
+            self.data = ''
+            
+        self.typeset()
+        
+        self.pos = 0
+        self.cursor = [0, 0]
+            
+    def setpos(self, pos):
+        pos = max(0, min(self.chars[-1].pos, pos))
+        char = self.chars[pos]
+        self.cursor = [char.y, char.x]
+        self.pos = pos
+        
+    def setcursor(self, cursor):
+        [y, x] = cursor
+        y = max(0, min(self.chars[-1].y, y))
+        for char in reversed(self.chars):
+            if [char.y, char.x] < [y, x]:
+                self.pos = char.pos
+                break
+        else:
+            self.pos = 0
+        self.cursor = [y, x]
+            
+    def typeset(self):
+        ll = 1
+        lc = 1
+        y, x = 0, 0
+        self.chars = []
+        
+        self.H, self.W = self.sc.getmaxyx()
+        self.h, self.w = self.H - 1, self.W - 5
+        
+        for i, ch in enumerate([*self.data, '']):
+            char = Char(
+                ch,
+                i,
+                ll,
+                lc,
+                y,
+                x,
+            )
+            self.chars.append(char)
+        
+            if ch == '\n':
+                ll, lc = ll+1, 1
+            else:
+                lc += 1
+                
+            if ch == '\n':
+                y, x = y+1, 0
+            elif x + 1 > self.w:
+                y, x = y+1, 0
+            else:
+                x += 1
+        
+    def on(self, key):
+        if key == 'KEY_RIGHT':
+            self.setpos(self.pos + 1)
+        elif key == 'KEY_LEFT':
+            self.setpos(self.pos - 1)
+        elif key == 'KEY_DOWN':
+            [y, x] = self.cursor
+            self.setcursor([y+1, x])
+        elif key == 'KEY_UP':
+            [y, x] = self.cursor
+            self.setcursor([y-1, x])
+        elif key == 'KEY_NPAGE':
+            [y, x] = self.cursor
+            self.setcursor([y+self.h, x])
+        elif key == 'KEY_PPAGE':
+            [y, x] = self.cursor
+            self.setcursor([y-self.h, x])
+        elif key == '\n' or len(key) == 1 and ' ' <= key <= '~':
+            data = self.data
+            data = data[:self.pos] + key + data[self.pos:]
+            self.data = data
+            self.typeset()
+            self.setpos(self.pos + 1)
+        elif key == 'KEY_BACKSPACE':
+            left = max(0, self.pos - 1)
+            data = self.data
+            data = data[:left] + data[self.pos:]
+            self.data = data
+            self.typeset()
+            self.setpos(self.pos - 1)
+        elif key == ctrl('L'):
+            lnbuffer = ''
+            while True:
+                key = self.sc.getkey()
+                if '0' <= key <= '9':
+                    lnbuffer += key
+                elif key == '\n':
+                    for char in self.chars:
+                        if char.ll == int(lnbuffer or '1'):
+                            self.setpos(char.pos)
+                            self.show(); return
+                    self.show(); return
+                elif key == ctrl('L'):
+                    break
+                self.sc.addstr(self.h, 0, lnbuffer)
+                self.sc.refresh()
+        elif key == ctrl('S'):
+            with open(self.fn, 'w+') as f:
+                f.write(self.data)
+
+        self.show()
+        
+    def show(self):
+        sc = self.sc
+        sc.clear()
+        
+        [yc, xc] = self.cursor
+        screens = yc // self.h
+        offset = screens * self.h
+        
+        for char in self.chars:
+            y, x = char.y - offset, char.x
+            if 0 <= y < self.h:
+                if char.ch not in ['\n', '']:
+                    ch = char.ch
+                    if 'a' <= ch.lower() <= 'z':
+                        color = 4
+                    elif '0' <= ch <= '9':
+                        color = 3
+                    else:
+                        color = 5
+                    
+                    sc.addch(y, x+5, char.ch, curses.color_pair(color))
+                
+                if char.lc == 1:
+                    sc.addstr(y, 0, str(char.ll))
+
+        yc = yc - offset
+        sc.move(yc, xc + 5)
+        
+        sc.refresh()
+
+def main(sc):
+    curses.raw()
+    curses.use_default_colors()
+    
+    curses.init_color(3, 1000, 1000, 0)
+    curses.init_pair(3, 3, 0)
+    
+    curses.init_color(4, 0, 800, 1000)
+    curses.init_pair(4, 4, 0)
+    
+    curses.init_color(5, 400, 400, 400)
+    curses.init_pair(5, 5, 0)
+    
+    [_, fn] = sys.argv
+    ed = Editor(sc, fn)
+    
+    ed.show()
+    while True:
+        key = sc.getkey()
+        
+        if key == ctrl('Q'): exit(0)
+        
+        ed.on(key)
+    
+curses.wrapper(main)
+
+def hello(a):
+    # TeX editor
+    ...
+    
+    
