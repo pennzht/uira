@@ -14,8 +14,6 @@ from colors import *
 import dbl    # sized_sequence{,_3}
 import initial_windows
 
-print ('Editor is running.')
-
 glob = {'windowid': 0}
 screen_cache = {}
 screen = {}
